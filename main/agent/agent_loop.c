@@ -157,10 +157,14 @@ static cJSON *build_tool_results(const llm_response_t *resp, const mimi_msg_t *m
 
         ESP_LOGI(TAG, "Tool %s result: %d bytes", call->name, (int)strlen(tool_output));
 
-        /* Build tool_result block */
+        /* Build tool_result block.
+         * "name" is stored alongside "tool_use_id" so that Gemini's
+         * functionResponse converter can emit the correct function name
+         * (Gemini requires functionResponse.name == original functionCall.name). */
         cJSON *result_block = cJSON_CreateObject();
         cJSON_AddStringToObject(result_block, "type", "tool_result");
         cJSON_AddStringToObject(result_block, "tool_use_id", call->id);
+        cJSON_AddStringToObject(result_block, "name", call->name);
         cJSON_AddStringToObject(result_block, "content", tool_output);
         cJSON_AddItemToArray(content, result_block);
     }
