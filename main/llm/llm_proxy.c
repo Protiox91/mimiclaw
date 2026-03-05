@@ -341,8 +341,9 @@ static esp_err_t llm_http_via_proxy(const char *post_data, resp_buf_t *rb, int *
             "Connection: close\r\n\r\n",
             llm_api_path(), llm_api_host(), s_api_key, body_len);
     } else if (provider_is_gemini()) {
-        /* Gemini: API key in URL query param, no auth header */
-        char gemini_path_with_key[256];
+        /* Gemini: API key in URL query param, no auth header.
+         * Buffer must fit: s_gemini_path (128) + "?key=" (5) + s_api_key (320) + NUL = 454 */
+        char gemini_path_with_key[512];
         snprintf(gemini_path_with_key, sizeof(gemini_path_with_key),
                  "%s?key=%s", s_gemini_path, s_api_key);
         hlen = snprintf(header, sizeof(header),
@@ -641,8 +642,32 @@ static cJSON *convert_messages_gemini(cJSON *messages)
     cJSON *contents = cJSON_CreateArray();
     if (!messages || !cJSON_IsArray(messages)) return contents;
 
+    /* Gemini enforces STRICT role alternation (user -> model -> user ...).
+     * The first turn MUST be "user".  Strip any leading assistant/model entries
+     * from the history so we never hand Gemini an invalid conversation.
+     * This also protects against corrupted session histories loaded from SPIFFS. */
+    int start_idx = 0;
+    int total = cJSON_GetArraySize(messages);
+    while (start_idx < total) {
+        cJSON *first = cJSON_GetArrayItem(messages, start_idx);
+        cJSON *first_role = first ? cJSON_GetObjectItem(first, "role") : NULL;
+        if (first_role && cJSON_IsString(first_role) &&
+            strcmp(first_role->valuestring, "user") != 0) {
+            start_idx++;
+        } else {
+            break;
+        }
+    }
+    if (start_idx > 0) {
+        ESP_LOGW(TAG, "Gemini: stripped %d leading non-user message(s) to satisfy role alternation",
+                 start_idx);
+    }
+
     cJSON *msg;
+    int msg_idx = 0;
     cJSON_ArrayForEach(msg, messages) {
+        if (msg_idx++ < start_idx) continue;  /* skip leading non-user turns */
+
         cJSON *role    = cJSON_GetObjectItem(msg, "role");
         cJSON *content = cJSON_GetObjectItem(msg, "content");
         if (!role || !cJSON_IsString(role)) continue;
@@ -707,9 +732,10 @@ static cJSON *convert_messages_gemini(cJSON *messages)
 
                 cJSON *response_obj = cJSON_CreateObject();
                 if (tcontent && cJSON_IsString(tcontent)) {
-                    cJSON_AddStringToObject(response_obj, "output", tcontent->valuestring);
+                    /* Gemini spec requires the field to be named "result" inside response */
+                    cJSON_AddStringToObject(response_obj, "result", tcontent->valuestring);
                 } else {
-                    cJSON_AddStringToObject(response_obj, "output", "");
+                    cJSON_AddStringToObject(response_obj, "result", "");
                 }
                 cJSON *fr = cJSON_CreateObject();
                 cJSON_AddStringToObject(fr, "name", fn);
@@ -801,8 +827,11 @@ static void parse_gemini_response(cJSON *root, llm_response_t *resp)
             strncpy(call->name, name->valuestring, sizeof(call->name) - 1);
         }
 
-        /* Gemini does not provide a stable call ID — generate a synthetic one */
-        snprintf(call->id, sizeof(call->id), "gemini_call_%d", resp->call_count);
+        /* Gemini does not provide call IDs — generate a synthetic one that
+         * embeds the function name so tool_result matching is debuggable. */
+        snprintf(call->id, sizeof(call->id), "gemini_%s_%d",
+                 (name && cJSON_IsString(name)) ? name->valuestring : "call",
+                 resp->call_count);
 
         cJSON *args = cJSON_GetObjectItem(fc, "args");
         if (args) {
