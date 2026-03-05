@@ -85,6 +85,9 @@
 #define MIMI_LLM_MAX_TOKENS          4096
 #define MIMI_LLM_API_URL             "https://api.anthropic.com/v1/messages"
 #define MIMI_OPENAI_API_URL          "https://api.openai.com/v1/chat/completions"
+#define MIMI_GEMINI_API_HOST         "generativelanguage.googleapis.com"
+#define MIMI_GEMINI_API_PATH_PREFIX  "/v1beta/models/"
+#define MIMI_GEMINI_API_PATH_SUFFIX  ":generateContent"
 #define MIMI_LLM_API_VERSION         "2023-06-01"
 #define MIMI_LLM_STREAM_BUF_SIZE     (32 * 1024)
 #define MIMI_LLM_LOG_VERBOSE_PAYLOAD 0
