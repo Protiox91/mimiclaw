@@ -22,6 +22,10 @@ static char s_api_key[LLM_API_KEY_MAX_LEN] = {0};
 static char s_model[LLM_MODEL_MAX_LEN] = MIMI_LLM_DEFAULT_MODEL;
 static char s_provider[16] = MIMI_LLM_PROVIDER_DEFAULT;
 
+/* Gemini: dynamically built URL and path (model-dependent) */
+static char s_gemini_url[256]  = {0};
+static char s_gemini_path[128] = {0};
+
 static void llm_log_payload(const char *label, const char *payload)
 {
     if (!payload) {
@@ -187,19 +191,45 @@ static bool provider_is_openai(void)
     return strcmp(s_provider, "openai") == 0;
 }
 
+static bool provider_is_gemini(void)
+{
+    return strcmp(s_provider, "gemini") == 0;
+}
+
+/* Rebuild Gemini URL/path whenever model or provider changes */
+static void gemini_rebuild_url(void)
+{
+    snprintf(s_gemini_path, sizeof(s_gemini_path),
+             "%s%s%s",
+             MIMI_GEMINI_API_PATH_PREFIX,
+             s_model,
+             MIMI_GEMINI_API_PATH_SUFFIX);
+    snprintf(s_gemini_url, sizeof(s_gemini_url),
+             "https://%s%s?key=%s",
+             MIMI_GEMINI_API_HOST,
+             s_gemini_path,
+             s_api_key);
+}
+
 static const char *llm_api_url(void)
 {
-    return provider_is_openai() ? MIMI_OPENAI_API_URL : MIMI_LLM_API_URL;
+    if (provider_is_openai()) return MIMI_OPENAI_API_URL;
+    if (provider_is_gemini()) return s_gemini_url;
+    return MIMI_LLM_API_URL;
 }
 
 static const char *llm_api_host(void)
 {
-    return provider_is_openai() ? "api.openai.com" : "api.anthropic.com";
+    if (provider_is_openai()) return "api.openai.com";
+    if (provider_is_gemini()) return MIMI_GEMINI_API_HOST;
+    return "api.anthropic.com";
 }
 
 static const char *llm_api_path(void)
 {
-    return provider_is_openai() ? "/v1/chat/completions" : "/v1/messages";
+    if (provider_is_openai()) return "/v1/chat/completions";
+    if (provider_is_gemini()) return s_gemini_path;
+    return "/v1/messages";
 }
 
 /* ── Init ─────────────────────────────────────────────────────── */
@@ -238,6 +268,11 @@ esp_err_t llm_proxy_init(void)
         nvs_close(nvs);
     }
 
+    /* Pre-build Gemini URL if needed */
+    if (provider_is_gemini()) {
+        gemini_rebuild_url();
+    }
+
     if (s_api_key[0]) {
         ESP_LOGI(TAG, "LLM proxy initialized (provider: %s, model: %s)", s_provider, s_model);
     } else {
@@ -271,7 +306,10 @@ static esp_err_t llm_http_direct(const char *post_data, resp_buf_t *rb, int *out
             snprintf(auth, sizeof(auth), "Bearer %s", s_api_key);
             esp_http_client_set_header(client, "Authorization", auth);
         }
+    } else if (provider_is_gemini()) {
+        /* Gemini authenticates via ?key= query parameter in the URL — no extra header needed */
     } else {
+        /* Anthropic */
         esp_http_client_set_header(client, "x-api-key", s_api_key);
         esp_http_client_set_header(client, "anthropic-version", MIMI_LLM_API_VERSION);
     }
@@ -302,7 +340,20 @@ static esp_err_t llm_http_via_proxy(const char *post_data, resp_buf_t *rb, int *
             "Content-Length: %d\r\n"
             "Connection: close\r\n\r\n",
             llm_api_path(), llm_api_host(), s_api_key, body_len);
+    } else if (provider_is_gemini()) {
+        /* Gemini: API key in URL query param, no auth header */
+        char gemini_path_with_key[256];
+        snprintf(gemini_path_with_key, sizeof(gemini_path_with_key),
+                 "%s?key=%s", s_gemini_path, s_api_key);
+        hlen = snprintf(header, sizeof(header),
+            "POST %s HTTP/1.1\r\n"
+            "Host: %s\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: %d\r\n"
+            "Connection: close\r\n\r\n",
+            gemini_path_with_key, llm_api_host(), body_len);
     } else {
+        /* Anthropic */
         hlen = snprintf(header, sizeof(header),
             "POST %s HTTP/1.1\r\n"
             "Host: %s\r\n"
@@ -532,6 +583,241 @@ static cJSON *convert_messages_openai(const char *system_prompt, cJSON *messages
     return out;
 }
 
+/* ── Gemini format converters ─────────────────────────────────── */
+
+/*
+ * Convert Anthropic-style tools array to Gemini functionDeclarations format.
+ *
+ * Anthropic tool:
+ *   { "name": "...", "description": "...", "input_schema": { ... } }
+ *
+ * Gemini tool wrapper:
+ *   { "functionDeclarations": [ { "name": "...", "description": "...", "parameters": { ... } } ] }
+ */
+static cJSON *convert_tools_gemini(const char *tools_json)
+{
+    if (!tools_json) return NULL;
+    cJSON *arr = cJSON_Parse(tools_json);
+    if (!arr || !cJSON_IsArray(arr)) {
+        cJSON_Delete(arr);
+        return NULL;
+    }
+
+    cJSON *decls = cJSON_CreateArray();
+    cJSON *tool;
+    cJSON_ArrayForEach(tool, arr) {
+        cJSON *name   = cJSON_GetObjectItem(tool, "name");
+        cJSON *desc   = cJSON_GetObjectItem(tool, "description");
+        cJSON *schema = cJSON_GetObjectItem(tool, "input_schema");
+        if (!name || !cJSON_IsString(name)) continue;
+
+        cJSON *decl = cJSON_CreateObject();
+        cJSON_AddStringToObject(decl, "name", name->valuestring);
+        if (desc && cJSON_IsString(desc)) {
+            cJSON_AddStringToObject(decl, "description", desc->valuestring);
+        }
+        if (schema) {
+            cJSON_AddItemToObject(decl, "parameters", cJSON_Duplicate(schema, 1));
+        }
+        cJSON_AddItemToArray(decls, decl);
+    }
+    cJSON_Delete(arr);
+
+    /* Wrap in the top-level tools object */
+    cJSON *tools_obj = cJSON_CreateObject();
+    cJSON_AddItemToObject(tools_obj, "functionDeclarations", decls);
+    return tools_obj;
+}
+
+/*
+ * Convert Anthropic-style messages + system prompt to Gemini "contents" format.
+ *
+ * Gemini roles: "user" / "model"  (not "assistant")
+ * Tool results become: role="user", parts=[{functionResponse:{name,response}}]
+ * Tool calls become:   role="model", parts=[{functionCall:{name,args}}]
+ */
+static cJSON *convert_messages_gemini(cJSON *messages)
+{
+    cJSON *contents = cJSON_CreateArray();
+    if (!messages || !cJSON_IsArray(messages)) return contents;
+
+    cJSON *msg;
+    cJSON_ArrayForEach(msg, messages) {
+        cJSON *role    = cJSON_GetObjectItem(msg, "role");
+        cJSON *content = cJSON_GetObjectItem(msg, "content");
+        if (!role || !cJSON_IsString(role)) continue;
+
+        const char *role_str = role->valuestring;
+        /* Map "assistant" -> "model" */
+        const char *gemini_role = (strcmp(role_str, "assistant") == 0) ? "model" : "user";
+
+        if (content && cJSON_IsString(content)) {
+            /* Simple text message */
+            cJSON *entry = cJSON_CreateObject();
+            cJSON_AddStringToObject(entry, "role", gemini_role);
+            cJSON *parts = cJSON_CreateArray();
+            cJSON *part  = cJSON_CreateObject();
+            cJSON_AddStringToObject(part, "text", content->valuestring);
+            cJSON_AddItemToArray(parts, part);
+            cJSON_AddItemToObject(entry, "parts", parts);
+            cJSON_AddItemToArray(contents, entry);
+            continue;
+        }
+
+        if (!content || !cJSON_IsArray(content)) continue;
+
+        /* Content is an array of blocks (Anthropic format) */
+        cJSON *parts = cJSON_CreateArray();
+        cJSON *block;
+        cJSON_ArrayForEach(block, content) {
+            cJSON *btype = cJSON_GetObjectItem(block, "type");
+            if (!btype || !cJSON_IsString(btype)) continue;
+
+            if (strcmp(btype->valuestring, "text") == 0) {
+                cJSON *text = cJSON_GetObjectItem(block, "text");
+                if (text && cJSON_IsString(text)) {
+                    cJSON *part = cJSON_CreateObject();
+                    cJSON_AddStringToObject(part, "text", text->valuestring);
+                    cJSON_AddItemToArray(parts, part);
+                }
+            } else if (strcmp(btype->valuestring, "tool_use") == 0) {
+                /* assistant tool call -> functionCall part */
+                cJSON *name  = cJSON_GetObjectItem(block, "name");
+                cJSON *input = cJSON_GetObjectItem(block, "input");
+                if (!name || !cJSON_IsString(name)) continue;
+                cJSON *fc   = cJSON_CreateObject();
+                cJSON_AddStringToObject(fc, "name", name->valuestring);
+                if (input) {
+                    cJSON_AddItemToObject(fc, "args", cJSON_Duplicate(input, 1));
+                } else {
+                    cJSON_AddItemToObject(fc, "args", cJSON_CreateObject());
+                }
+                cJSON *part = cJSON_CreateObject();
+                cJSON_AddItemToObject(part, "functionCall", fc);
+                cJSON_AddItemToArray(parts, part);
+            } else if (strcmp(btype->valuestring, "tool_result") == 0) {
+                /* user tool result -> functionResponse part */
+                cJSON *tool_name = cJSON_GetObjectItem(block, "tool_use_id"); /* used as name fallback */
+                cJSON *tcontent  = cJSON_GetObjectItem(block, "content");
+                /* Try to find the actual tool name from context — use tool_use_id as name */
+                cJSON *fr_name   = cJSON_GetObjectItem(block, "name");
+                const char *fn   = (fr_name && cJSON_IsString(fr_name))
+                                   ? fr_name->valuestring
+                                   : (tool_name && cJSON_IsString(tool_name) ? tool_name->valuestring : "tool");
+
+                cJSON *response_obj = cJSON_CreateObject();
+                if (tcontent && cJSON_IsString(tcontent)) {
+                    cJSON_AddStringToObject(response_obj, "output", tcontent->valuestring);
+                } else {
+                    cJSON_AddStringToObject(response_obj, "output", "");
+                }
+                cJSON *fr = cJSON_CreateObject();
+                cJSON_AddStringToObject(fr, "name", fn);
+                cJSON_AddItemToObject(fr, "response", response_obj);
+                cJSON *part = cJSON_CreateObject();
+                cJSON_AddItemToObject(part, "functionResponse", fr);
+                cJSON_AddItemToArray(parts, part);
+            }
+        }
+
+        if (cJSON_GetArraySize(parts) > 0) {
+            cJSON *entry = cJSON_CreateObject();
+            cJSON_AddStringToObject(entry, "role", gemini_role);
+            cJSON_AddItemToObject(entry, "parts", parts);
+            cJSON_AddItemToArray(contents, entry);
+        } else {
+            cJSON_Delete(parts);
+        }
+    }
+
+    return contents;
+}
+
+/*
+ * Parse Gemini generateContent response into llm_response_t.
+ *
+ * Gemini response structure:
+ * {
+ *   "candidates": [{
+ *     "content": {
+ *       "parts": [
+ *         { "text": "..." },
+ *         { "functionCall": { "name": "...", "args": {...} } }
+ *       ],
+ *       "role": "model"
+ *     },
+ *     "finishReason": "STOP" | "MAX_TOKENS" | "OTHER"
+ *   }]
+ * }
+ */
+static void parse_gemini_response(cJSON *root, llm_response_t *resp)
+{
+    cJSON *candidates = cJSON_GetObjectItem(root, "candidates");
+    if (!candidates || !cJSON_IsArray(candidates)) return;
+
+    cJSON *cand0 = cJSON_GetArrayItem(candidates, 0);
+    if (!cand0) return;
+
+    cJSON *content = cJSON_GetObjectItem(cand0, "content");
+    if (!content) return;
+
+    cJSON *parts = cJSON_GetObjectItem(content, "parts");
+    if (!parts || !cJSON_IsArray(parts)) return;
+
+    /* First pass: accumulate total text length */
+    size_t total_text = 0;
+    cJSON *part;
+    cJSON_ArrayForEach(part, parts) {
+        cJSON *text = cJSON_GetObjectItem(part, "text");
+        if (text && cJSON_IsString(text)) {
+            total_text += strlen(text->valuestring);
+        }
+    }
+
+    if (total_text > 0) {
+        resp->text = calloc(1, total_text + 1);
+        if (resp->text) {
+            cJSON_ArrayForEach(part, parts) {
+                cJSON *text = cJSON_GetObjectItem(part, "text");
+                if (!text || !cJSON_IsString(text)) continue;
+                size_t tlen = strlen(text->valuestring);
+                memcpy(resp->text + resp->text_len, text->valuestring, tlen);
+                resp->text_len += tlen;
+            }
+            resp->text[resp->text_len] = '\0';
+        }
+    }
+
+    /* Second pass: extract function calls */
+    cJSON_ArrayForEach(part, parts) {
+        cJSON *fc = cJSON_GetObjectItem(part, "functionCall");
+        if (!fc) continue;
+        if (resp->call_count >= MIMI_MAX_TOOL_CALLS) break;
+
+        llm_tool_call_t *call = &resp->calls[resp->call_count];
+
+        cJSON *name = cJSON_GetObjectItem(fc, "name");
+        if (name && cJSON_IsString(name)) {
+            strncpy(call->name, name->valuestring, sizeof(call->name) - 1);
+        }
+
+        /* Gemini does not provide a stable call ID — generate a synthetic one */
+        snprintf(call->id, sizeof(call->id), "gemini_call_%d", resp->call_count);
+
+        cJSON *args = cJSON_GetObjectItem(fc, "args");
+        if (args) {
+            char *args_str = cJSON_PrintUnformatted(args);
+            if (args_str) {
+                call->input     = args_str;
+                call->input_len = strlen(args_str);
+            }
+        }
+
+        resp->call_count++;
+        resp->tool_use = true;
+    }
+}
+
 /* ── Public: chat with tools (non-streaming) ──────────────────── */
 
 void llm_response_free(llm_response_t *resp)
@@ -556,16 +842,54 @@ esp_err_t llm_chat_tools(const char *system_prompt,
 
     if (s_api_key[0] == '\0') return ESP_ERR_INVALID_STATE;
 
-    /* Build request body (non-streaming) */
-    cJSON *body = cJSON_CreateObject();
-    cJSON_AddStringToObject(body, "model", s_model);
-    if (provider_is_openai()) {
-        cJSON_AddNumberToObject(body, "max_completion_tokens", MIMI_LLM_MAX_TOKENS);
-    } else {
-        cJSON_AddNumberToObject(body, "max_tokens", MIMI_LLM_MAX_TOKENS);
+    /* Gemini URL embeds both model and API key — rebuild whenever we call */
+    if (provider_is_gemini()) {
+        gemini_rebuild_url();
     }
 
-    if (provider_is_openai()) {
+    /* Build request body (non-streaming) */
+    cJSON *body = cJSON_CreateObject();
+
+    if (provider_is_gemini()) {
+        /*
+         * Gemini generateContent request:
+         * {
+         *   "system_instruction": { "parts": [{ "text": "..." }] },
+         *   "contents": [ ... ],
+         *   "tools": [ { "functionDeclarations": [...] } ],
+         *   "generationConfig": { "maxOutputTokens": N }
+         * }
+         */
+        if (system_prompt && system_prompt[0]) {
+            cJSON *sys_instr = cJSON_CreateObject();
+            cJSON *sys_parts = cJSON_CreateArray();
+            cJSON *sys_part  = cJSON_CreateObject();
+            cJSON_AddStringToObject(sys_part, "text", system_prompt);
+            cJSON_AddItemToArray(sys_parts, sys_part);
+            cJSON_AddItemToObject(sys_instr, "parts", sys_parts);
+            cJSON_AddItemToObject(body, "system_instruction", sys_instr);
+        }
+
+        cJSON *contents = convert_messages_gemini(messages);
+        cJSON_AddItemToObject(body, "contents", contents);
+
+        if (tools_json) {
+            cJSON *tools_obj = convert_tools_gemini(tools_json);
+            if (tools_obj) {
+                cJSON *tools_arr = cJSON_CreateArray();
+                cJSON_AddItemToArray(tools_arr, tools_obj);
+                cJSON_AddItemToObject(body, "tools", tools_arr);
+            }
+        }
+
+        cJSON *gen_config = cJSON_CreateObject();
+        cJSON_AddNumberToObject(gen_config, "maxOutputTokens", MIMI_LLM_MAX_TOKENS);
+        cJSON_AddItemToObject(body, "generationConfig", gen_config);
+
+    } else if (provider_is_openai()) {
+        cJSON_AddStringToObject(body, "model", s_model);
+        cJSON_AddNumberToObject(body, "max_completion_tokens", MIMI_LLM_MAX_TOKENS);
+
         cJSON *openai_msgs = convert_messages_openai(system_prompt, messages);
         cJSON_AddItemToObject(body, "messages", openai_msgs);
 
@@ -577,6 +901,9 @@ esp_err_t llm_chat_tools(const char *system_prompt,
             }
         }
     } else {
+        /* Anthropic */
+        cJSON_AddStringToObject(body, "model", s_model);
+        cJSON_AddNumberToObject(body, "max_tokens", MIMI_LLM_MAX_TOKENS);
         cJSON_AddStringToObject(body, "system", system_prompt);
 
         /* Deep-copy messages so caller keeps ownership */
@@ -635,7 +962,9 @@ esp_err_t llm_chat_tools(const char *system_prompt,
         return ESP_FAIL;
     }
 
-    if (provider_is_openai()) {
+    if (provider_is_gemini()) {
+        parse_gemini_response(root, resp);
+    } else if (provider_is_openai()) {
         cJSON *choices = cJSON_GetObjectItem(root, "choices");
         cJSON *choice0 = choices && cJSON_IsArray(choices) ? cJSON_GetArrayItem(choices, 0) : NULL;
         if (choice0) {
@@ -781,6 +1110,9 @@ esp_err_t llm_set_api_key(const char *api_key)
 
     safe_copy(s_api_key, sizeof(s_api_key), api_key);
     ESP_LOGI(TAG, "API key saved");
+    if (provider_is_gemini()) {
+        gemini_rebuild_url();
+    }
     return ESP_OK;
 }
 
@@ -794,6 +1126,9 @@ esp_err_t llm_set_model(const char *model)
 
     safe_copy(s_model, sizeof(s_model), model);
     ESP_LOGI(TAG, "Model set to: %s", s_model);
+    if (provider_is_gemini()) {
+        gemini_rebuild_url();
+    }
     return ESP_OK;
 }
 
@@ -807,5 +1142,8 @@ esp_err_t llm_set_provider(const char *provider)
 
     safe_copy(s_provider, sizeof(s_provider), provider);
     ESP_LOGI(TAG, "Provider set to: %s", s_provider);
+    if (provider_is_gemini()) {
+        gemini_rebuild_url();
+    }
     return ESP_OK;
 }
